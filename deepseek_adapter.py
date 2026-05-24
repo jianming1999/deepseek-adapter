@@ -378,7 +378,13 @@ async def list_models():
             {"id": "deepseek-v4-pro", "object": "model", "created": 1700000000, "owned_by": "deepseek"},
             {"id": "deepseek-chat", "object": "model", "created": 1700000000, "owned_by": "deepseek"},
             {"id": "deepseek-reasoner", "object": "model", "created": 1700000000, "owned_by": "deepseek"},
-        ]
+        ],
+        "provider": {
+            "name": "deepseek",
+            "requires_oauth": False,
+            "auth_mode": "api_key",
+            "api_key_required": True,
+        }
     }
 
 
@@ -596,6 +602,11 @@ async def login_endpoints(request: Request):
         "models": ["deepseek-v4-flash", "deepseek-v4-pro"],
         "provider": "deepseek",
         "status": "authenticated",
+        "requires_oauth": False,
+        "auth_mode": "api_key",
+        "api_key_configured": True,
+        "oauth_enabled": False,
+        "allow_api_key_auth": True,
     })
 
 
@@ -727,6 +738,9 @@ async def catch_all(request: Request, path_name: str):
         "models": ["deepseek-v4-flash", "deepseek-v4-pro"],
         "provider": "deepseek",
         "authenticated": True,
+        "requires_oauth": False,
+        "auth_mode": "api_key",
+        "oauth_enabled": False,
     })
 
 
