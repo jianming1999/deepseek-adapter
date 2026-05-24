@@ -567,6 +567,45 @@ async def _handle_non_streaming(
     return JSONResponse(content=oai_response)
 
 
+# ── Codex Login / Auth Endpoints ────────────────────────────────────────
+# Codex sometimes calls /login or similar endpoints to verify auth.
+# Since we use API-key based auth, we accept any bearer token and return success.
+
+
+@app.api_route("/login", methods=["GET", "POST", "PUT", "OPTIONS"])
+@app.api_route("/api/login", methods=["GET", "POST", "PUT", "OPTIONS"])
+@app.api_route("/v1/login", methods=["GET", "POST", "PUT", "OPTIONS"])
+@app.api_route("/auth", methods=["GET", "POST", "PUT", "OPTIONS"])
+@app.api_route("/api/auth", methods=["GET", "POST", "PUT", "OPTIONS"])
+@app.api_route("/v1/auth", methods=["GET", "POST", "PUT", "OPTIONS"])
+async def login_endpoints(request: Request):
+    """Catch-all login/auth endpoint."""
+    log.info(f"→ Login/auth: {request.method} {request.url.path}")
+    return JSONResponse(content={
+        "id": "user_placeholder",
+        "object": "user",
+        "name": "deepseek-user",
+        "email": "user@deepseek.local",
+        "auth": {
+            "type": "bearer",
+            "token_type": "Bearer",
+            "access_token": "deepseek-adapter-token",
+            "scope": "openid profile email",
+        },
+        "orgs": [{"id": "org_deepseek", "name": "DeepSeek Adapter", "role": "owner"}],
+        "models": ["deepseek-v4-flash", "deepseek-v4-pro"],
+        "provider": "deepseek",
+        "status": "authenticated",
+    })
+
+
+# ── Codex uses /responses (not /v1/responses) ───────────────────────────
+@app.api_route("/responses", methods=["POST"])
+async def create_response_codex(request: Request):
+    log.info("→ /responses → forwarding")
+    return await create_response(request)
+
+
 async def _handle_streaming(
     client: httpx.AsyncClient,
     url: str,
@@ -673,6 +712,24 @@ async def chat_completions(request: Request):
         return JSONResponse(content=resp.json(), status_code=resp.status_code)
 
 
+# ── Catch-all for unknown endpoints ────────────────────────────────────
+# Must be the LAST route registered (before the if-main block).
+
+
+@app.api_route("/{path_name:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"])
+async def catch_all(request: Request, path_name: str):
+    """Catch any unhandled paths."""
+    log.info(f"→ Unknown path: {request.method} /{path_name}")
+    return JSONResponse(content={
+        "endpoint": f"/{path_name}",
+        "status": "ok",
+        "message": "DeepSeek Adapter running",
+        "models": ["deepseek-v4-flash", "deepseek-v4-pro"],
+        "provider": "deepseek",
+        "authenticated": True,
+    })
+
+
 # ── Entry ───────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     if not DEEPSEEK_API_KEY:
@@ -692,3 +749,5 @@ if __name__ == "__main__":
     log.info("  (The adapter forwards requests to DeepSeek using your DEEPSEEK_API_KEY)")
 
     uvicorn.run(app, host=HOST, port=PORT, log_level=LOG_LEVEL.lower())
+
+
