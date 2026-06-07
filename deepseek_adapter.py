@@ -81,6 +81,11 @@ logging.basicConfig(
 )
 log = logging.getLogger("deepseek-adapter")
 
+# ── In-memory Conversation Store ────────────────────────────────────────
+# Stores conversation state so Codex can create branches via previous_response_id.
+# Key: conversation_id → {id, created_at, model, messages: [...]}
+_conversations: Dict[str, Dict[str, Any]] = {}
+
 
 # ── HTTP Client ─────────────────────────────────────────────────────────
 _client: Optional[httpx.AsyncClient] = None
@@ -244,6 +249,9 @@ def deepseek_response_to_openai(
     ds_response: Dict[str, Any],
     request_model: str,
     request_id: str,
+    conversation_id: str = "",
+    previous_response_id: Optional[str] = None,
+    instructions: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Convert DeepSeek Chat Completions response to OpenAI Responses API format.
@@ -291,8 +299,9 @@ def deepseek_response_to_openai(
     response: Dict[str, Any] = {
         "id": request_id,
         "object": "response",
-        "created": int(time.time()),
+        "created_at": int(time.time()),
         "model": request_model,
+        "conversation_id": conversation_id,
         "status": "completed",
         "output": output_items,
         "usage": {
@@ -303,6 +312,11 @@ def deepseek_response_to_openai(
             "output_tokens_details": {"reasoning_tokens": usage.get("completion_tokens_details", {}).get("reasoning_tokens", 0) if isinstance(usage.get("completion_tokens_details"), dict) else 0},
         },
     }
+
+    if previous_response_id:
+        response["previous_response_id"] = previous_response_id
+    if instructions:
+        response["instructions"] = instructions
 
     return response
 
@@ -414,10 +428,18 @@ async def create_response(request: Request):
     request_id = body.get("request_id", f"req_{uuid.uuid4().hex[:12]}")
     requested_model = body.get("model", DEFAULT_DEEPSEEK_MODEL)
     deepseek_model = resolve_model(requested_model)
+    previous_response_id = body.get("previous_response_id")
     is_stream = body.get("stream", False)
 
-    log.info(f"→ {requested_model} → {deepseek_model} | stream={is_stream} | id={request_id}")
+    # ── Conversation handling ──
+    conversation_id = body.get("conversation_id") or f"conv_{uuid.uuid4().hex[:12]}"
+    if previous_response_id and previous_response_id in _conversations:
+        conversation_id = _conversations[previous_response_id]["id"]
+
+    log.info(f"→ {requested_model} → {deepseek_model} | stream={is_stream} | id={request_id} | conv={conversation_id}")
     log.info(f"  req body keys: {list(body.keys())}")
+    if previous_response_id:
+        log.info(f"  previous_response_id: {previous_response_id}")
     if body.get("reasoning"):
         log.info(f"  reasoning: {json.dumps(body['reasoning'], ensure_ascii=False)[:200]}")
     if body.get("reasoning_effort"):
@@ -426,10 +448,32 @@ async def create_response(request: Request):
     # ── Build DeepSeek request ──
     dm = convert_responses_input_to_messages(body.get("input", ""))
 
+    # ── Inject conversation history from previous_response_id ──
+    if previous_response_id and previous_response_id in _conversations:
+        conv = _conversations[previous_response_id]
+        conv_messages = conv.get("messages", [])
+        if conv_messages:
+            dm = conv_messages + dm
+            log.info(f"  ← prepended {len(conv_messages)} messages from conversation {previous_response_id}")
+
     # Handle instructions → system message
     instructions = body.get("instructions")
     if instructions and isinstance(instructions, str):
         dm.insert(0, {"role": "system", "content": instructions})
+
+    # ── Store / update conversation ──
+    if conversation_id not in _conversations:
+        _conversations[conversation_id] = {
+            "id": conversation_id,
+            "object": "conversation",
+            "created_at": int(time.time()),
+            "model": requested_model,
+            "messages": [],
+            "metadata": body.get("metadata", {}),
+        }
+        log.info(f"  + new conversation: {conversation_id}")
+    _conversations[conversation_id]["messages"] = list(dm)
+    _conversations[conversation_id]["model"] = requested_model
 
     # ── Map reasoning_effort (Responses API) → thinking + reasoning_effort (DeepSeek) ──
     # DeepSeek's thinking parameter controls whether thinking output is enabled.
@@ -519,9 +563,9 @@ async def create_response(request: Request):
     ds_url = f"{DEEPSEEK_BASE_URL}/v1/chat/completions"
 
     if is_stream:
-        return await _handle_streaming(client, ds_url, headers, ds_request, request_id, requested_model)
+        return await _handle_streaming(client, ds_url, headers, ds_request, request_id, requested_model, conversation_id, previous_response_id, instructions)
     else:
-        return await _handle_non_streaming(client, ds_url, headers, ds_request, request_id, requested_model)
+        return await _handle_non_streaming(client, ds_url, headers, ds_request, request_id, requested_model, conversation_id, previous_response_id, instructions)
 
 
 async def _handle_non_streaming(
@@ -531,6 +575,9 @@ async def _handle_non_streaming(
     ds_request: Dict[str, Any],
     request_id: str,
     requested_model: str,
+    conversation_id: str = "",
+    previous_response_id: Optional[str] = None,
+    instructions: Optional[str] = None,
 ) -> JSONResponse:
     """Non-streaming: call DeepSeek, translate response."""
     try:
@@ -568,7 +615,14 @@ async def _handle_non_streaming(
             content=build_error_response(502, f"Invalid DeepSeek response: {e}", request_id),
         )
 
-    oai_response = deepseek_response_to_openai(ds_response, requested_model, request_id)
+    oai_response = deepseek_response_to_openai(
+        ds_response,
+        requested_model,
+        request_id,
+        conversation_id=conversation_id,
+        previous_response_id=previous_response_id,
+        instructions=instructions,
+    )
     log.info(f"✓ {request_id} | tokens: {oai_response['usage']['total_tokens']}")
     return JSONResponse(content=oai_response)
 
@@ -624,12 +678,18 @@ async def _handle_streaming(
     ds_request: Dict[str, Any],
     request_id: str,
     requested_model: str,
+    conversation_id: str = "",
+    previous_response_id: Optional[str] = None,
+    instructions: Optional[str] = None,
 ) -> StreamingResponse:
     """Streaming: translate each DeepSeek chunk to Responses API SSE format."""
 
     async def event_stream():
         # Start event
-        yield f"data: {json.dumps({'type': 'response.created', 'response': {'id': request_id, 'model': requested_model, 'status': 'in_progress'}}, ensure_ascii=False)}\n\n"
+        resp_meta = {"id": request_id, "model": requested_model, "status": "in_progress"}
+        if conversation_id:
+            resp_meta["conversation_id"] = conversation_id
+        yield f"data: {json.dumps({'type': 'response.created', 'response': resp_meta}, ensure_ascii=False)}\n\n"
 
         try:
             async with client.stream("POST", url, json=ds_request, headers=headers) as resp:
@@ -721,6 +781,53 @@ async def chat_completions(request: Request):
     else:
         resp = await client.post(url, json=body, headers=headers)
         return JSONResponse(content=resp.json(), status_code=resp.status_code)
+
+
+# ── Conversation Management Endpoints ───────────────────────────────────
+
+
+@app.api_route("/v1/conversations", methods=["POST"])
+async def create_conversation(request: Request):
+    """Create a new conversation (Codex calls this before sending messages)."""
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+
+    conv_id = f"conv_{uuid.uuid4().hex[:12]}"
+    model = body.get("model", DEFAULT_DEEPSEEK_MODEL)
+
+    _conversations[conv_id] = {
+        "id": conv_id,
+        "object": "conversation",
+        "created_at": int(time.time()),
+        "model": model,
+        "messages": [],
+        "metadata": body.get("metadata", {}),
+    }
+
+    log.info(f"  + POST /v1/conversations → {conv_id}")
+    return JSONResponse(content=_conversations[conv_id])
+
+
+@app.api_route("/v1/conversations/{conversation_id}", methods=["GET"])
+async def get_conversation(conversation_id: str):
+    """Get conversation details."""
+    conv = _conversations.get(conversation_id)
+    if not conv:
+        conv = {
+            "id": conversation_id,
+            "object": "conversation",
+            "created_at": int(time.time()),
+            "model": DEFAULT_DEEPSEEK_MODEL,
+            "messages": [],
+            "metadata": {},
+        }
+        _conversations[conversation_id] = conv
+        log.info(f"  ? GET /v1/conversations/{conversation_id} → not found, created placeholder")
+    else:
+        log.info(f"  ← GET /v1/conversations/{conversation_id}")
+    return JSONResponse(content=conv)
 
 
 # ── Catch-all for unknown endpoints ────────────────────────────────────
